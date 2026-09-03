@@ -4,25 +4,34 @@ from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent, ImageContent
 
 # Initialize the Model Context Protocol Server
 mcp_server = Server("torch-mobile-mcp")
 
-# --- DEFINE PYTORCH TOOLS FOR CLAUDE ---
-@mcp_server.tool()
-async def check_torch_env() -> str:
-    """Checks the remote server's PyTorch version and setup environment."""
-    return f"PyTorch version {torch.__version__} is running successfully on CPU."
+# --- DEFINE PYTORCH TOOLS FOR CLAUDE (CORRECTED SYNTAX) ---
 
-@mcp_server.tool()
-async def tensor_calculator(matrix_a: str, matrix_b: str, operation: str) -> str:
-    """Executes safe element-wise matrix math or matrix multiplications using PyTorch."""
-    try:
-        # Example safety input parser for basic torch logic evaluation
-        return "Tensor calculation processed successfully."
-    except Exception as e:
-        return f"Error executing tensor operation: {str(e)}"
+@mcp_server.list_tools()
+async def handle_list_tools():
+    """List available tools for Claude."""
+    return [
+        {
+            "name": "check_torch_env",
+            "description": "Checks the remote server's PyTorch version and setup environment.",
+            "inputSchema": {"type": "object", "properties": {}}
+        }
+    ]
+
+@mcp_server.call_tool()
+async def handle_call_tool(name: str, arguments: dict):
+    """Execute the tools when Claude requests them."""
+    if name == "check_torch_env":
+        return [
+            {
+                "type": "text",
+                "text": f"PyTorch version {torch.__version__} is running successfully on CPU."
+            }
+        ]
+    raise ValueError(f"Unknown tool: {name}")
 
 # --- SSE TRANSPORT INTEGRATION ---
 sse_transport = SseServerTransport("/messages")
