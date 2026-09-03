@@ -1,9 +1,8 @@
 import os
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server import Server
-from mcp.server.fastapi import FastHtmlServer
 from mcp.types import Tool, TextContent
 
 # 1. Initialize the core stable MCP Server
@@ -44,12 +43,11 @@ app.add_middleware(
 )
 
 # 5. Initialize the server transport pathway cleanly
-# This assigns the background event queue directly to ensure it hooks into FastAPI
 @app.on_event("startup")
 async def startup_event():
     app.state.mcp_server = mcp_server
 
-# 6. Bind the SSE transport pathways manually to avoid import mapping errors
+# 6. Bind the SSE transport pathways manually with explicit Request references
 from mcp.server.sse import SseServerTransport
 sse_transport = SseServerTransport("/messages")
 
