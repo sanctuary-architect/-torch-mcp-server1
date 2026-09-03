@@ -3,10 +3,10 @@ import torch
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server import Server
-from mcp.server.fastapi import FastApiServer
+from mcp.server.fastapi import FastHtmlServer
 from mcp.types import Tool, TextContent
 
-# 1. Create the core MCP Server instance
+# 1. Initialize the core stable MCP Server
 mcp_server = Server("torch-mobile-mcp")
 
 # 2. Register tools exactly how the SDK expects them
@@ -43,9 +43,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 5. Initialize the official FastApiServer wrapper to automatically manage the SSE handshake
-# This creates /sse and /messages endpoints natively with built-in initialization handling
-mcp_fastapi_wrapper = FastApiServer(mcp_server)
+# 5. Initialize the server transport pathway cleanly
+# This assigns the background event queue directly to ensure it hooks into FastAPI
+@app.on_event("startup")
+async def startup_event():
+    app.state.mcp_server = mcp_server
 
-# Link the protocol wrapper directly into our web application router paths
-app.include_router(mcp_fastapi_wrapper.router, prefix="")
+# 6. Bind the SSE transport pathways manually to avoid import mapping errors
+from mcp.server.sse import SseServerTransport
+sse_transport = SseServerTransport("/messages")
+
+@app.get("/sse")
+@app.get("/sse/")
+async def handle_sse(request: Request):
+    async with sse_transport.connect_sse(request.scope, request.receive, request.send) as queue:
+        await mcp_server.run(queue, sse_transport.extra_context())
+
+@app.post("/messages")
+@app.post("/messages/")
+async def handle_messages(request: Request):
+    await sse_transport.handle_post_message(request)
