@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Expose port 10000 explicitly as a fallback
 EXPOSE 10000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+# Using shell form to correctly resolve Render's dynamic port environment variable if it shifts
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}
