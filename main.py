@@ -1,16 +1,15 @@
 import os
 import torch
-from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server import Server
-from mcp.server.sse import SseServerTransport
+from mcp.server.fastapi import FastApiServer
 from mcp.types import Tool, TextContent
 
-# 1. Initialize the core stable MCP Server
+# 1. Create the core MCP Server instance
 mcp_server = Server("torch-mobile-mcp")
 
-# 2. Re-register the tools using the direct function syntax to avoid registration crashes
+# 2. Register tools exactly how the SDK expects them
 @mcp_server.list_tools()
 async def handle_list_tools():
     return [
@@ -32,9 +31,10 @@ async def handle_call_tool(name: str, arguments: dict):
         ]
     raise ValueError(f"Unknown tool: {name}")
 
-# 3. Setup the FastAPI app framework
+# 3. Create a standard FastAPI application instance
 app = FastAPI()
 
+# 4. Apply global CORS settings so Claude's mobile infrastructure is authorized
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,20 +43,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 4. Bind the SSE transport routing pathways properly
-sse_transport = SseServerTransport("/messages")
+# 5. Initialize the official FastApiServer wrapper to automatically manage the SSE handshake
+# This creates /sse and /messages endpoints natively with built-in initialization handling
+mcp_fastapi_wrapper = FastApiServer(mcp_server)
 
-@app.get("/")
-async def root():
-    return {"status": "healthy", "message": "Use /sse endpoint"}
-
-@app.get("/sse")
-@app.get("/sse/")
-async def handle_sse(request: Request):
-    async with sse_transport.connect_sse(request.scope, request.receive, request.send) as queue:
-        await mcp_server.run(queue, sse_transport.extra_context())
-
-@app.post("/messages")
-@app.post("/messages/")
-async def handle_messages(request: Request):
-    await sse_transport.handle_post_message(request)
+# Link the protocol wrapper directly into our web application router paths
+app.include_router(mcp_fastapi_wrapper.router, prefix="")
