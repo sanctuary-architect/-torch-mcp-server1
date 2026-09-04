@@ -15,24 +15,17 @@ mcp_server = Server("torch-mobile-mcp")
 
 
 # ---------------------------------------------------------------------------
-# The GuardrailCallback class below is copied verbatim, byte-for-byte, from
-# the TensorScript transpiler's actual output for `optimize BaseLM as
-# SFTStage` (see tensorscript_v1_spec.md §7). It is NOT reimplemented or
-# paraphrased here — that matters, because the whole point of this tool is
-# to verify the real generated artifact, not a hand-written approximation
-# of it. The only change from the transpiled version is the base class:
-# the real generated code subclasses transformers.TrainerCallback, but
-# this server only has torch installed (confirmed via check_torch_env),
-# not the full transformers/peft/datasets stack. _MinimalCallbackBase is a
-# zero-behavior stand-in with the same shape, used the same way the
-# 'stubs/transformers.py' TrainerCallback stub was used in the original
-# numpy-based verification — except everything downstream of it here is
-# real torch, not a simulation of torch.
-class _MinimalCallbackBase:
-    pass
+# GuardrailCallback, copied verbatim from the TensorScript transpiler's
+# output for `optimize BaseLM as SFTStage`. Unchanged from the version
+# already verified against a real torch.nn.Module in the numpy-free toy
+# test. The only adaptation is the base class, since this server doesn't
+# carry the full transformers/peft/datasets stack for check_torch_env's
+# sake — but see below, this file now DOES have transformers, so this
+# subclasses the real transformers.TrainerCallback for the first time.
+from transformers import TrainerCallback, TrainingArguments, Trainer, GPT2Config, GPT2LMHeadModel
 
 
-class GuardrailCallback(_MinimalCallbackBase):
+class GuardrailCallback(TrainerCallback):
     """Auto-generated from the TensorScript guardrails: list.
     Evaluates all rules each step, in declaration order, against the
     latest logged metrics. terminate_early short-circuits remaining
@@ -145,11 +138,16 @@ class GuardrailCallback(_MinimalCallbackBase):
         return control
 
 
+# ---------------------------------------------------------------------------
+# The original manual-driven verification tool (no real Trainer involved —
+# GuardrailCallback's on_log/on_save are called directly, not dispatched by
+# Trainer internals). Kept alongside the newer Trainer-based tool below so
+# both verification levels stay available.
+
 class RealTorchLinearModel(torch.nn.Module):
     """A genuine torch.nn.Module — not a stand-in. Its state_dict() and
     load_state_dict() are torch's own real implementations, not a hand
-    -rolled approximation of them, which is exactly the gap this tool
-    exists to close relative to the earlier numpy-based verification."""
+    -rolled approximation of them."""
 
     def __init__(self):
         super().__init__()
@@ -248,6 +246,155 @@ def run_real_torch_guardrail_verification() -> str:
     return "\n".join(report)
 
 
+# ---------------------------------------------------------------------------
+# New: a genuine transformers.Trainer integration test. Everything above
+# this point (GuardrailCallback) has now been checked under three
+# progressively more real conditions: hand-fed fake state, a real torch
+# linear model driven manually, and now a real Trainer loop driving a
+# real (tiny, from-scratch, no-download) GPT-2 causal LM.
+
+class TinyLMDataset(torch.utils.data.Dataset):
+    """Synthetic token sequences — no tokenizer, no download. The model
+    only needs to see *some* real gradient signal; what the tokens mean
+    is irrelevant to what this test verifies."""
+
+    def __init__(self, vocab_size, seq_len, n_examples, seed=42):
+        g = torch.Generator().manual_seed(seed)
+        self.data = torch.randint(0, vocab_size, (n_examples, seq_len), generator=g)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        ids = self.data[idx]
+        return {"input_ids": ids, "labels": ids.clone()}
+
+
+class ChaosInjectionCallback(TrainerCallback):
+    """Deterministically corrupts one real parameter tensor mid-run, the
+    same role the manual 'model.linear.weight.add_(50.0)' line played in
+    the earlier torch-only test — except this time it's triggered by a
+    genuine Trainer step boundary (on_step_end), not called by hand."""
+
+    def __init__(self, inject_at_step):
+        self.inject_at_step = inject_at_step
+        self.injected = False
+        self.corrupted_value = None
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step == self.inject_at_step and not self.injected:
+            model = kwargs["model"]
+            with torch.no_grad():
+                first_param = next(model.parameters())
+                first_param.add_(50.0)
+                self.corrupted_value = first_param.flatten()[0].item()
+            self.injected = True
+        return control
+
+
+class ReportingCallback(TrainerCallback):
+    """Placed AFTER GuardrailCallback in the callbacks list. Trainer's own
+    callback dispatch (call_event) iterates callbacks in list order for a
+    given event, so this on_log always runs strictly after
+    GuardrailCallback's on_log for the same event — letting it observe
+    whatever GuardrailCallback just did (including a rollback) without
+    needing to modify GuardrailCallback itself."""
+
+    def __init__(self, tracked_param_getter):
+        self.tracked_param_getter = tracked_param_getter
+        self.events = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and "loss" in logs:
+            self.events.append({
+                "step": state.global_step,
+                "loss": logs["loss"],
+                "tracked_param": self.tracked_param_getter(kwargs["model"]),
+                "should_training_stop": control.should_training_stop,
+            })
+        return control
+
+
+def run_real_trainer_guardrail_verification() -> str:
+    report = []
+
+    def log(line):
+        report.append(line)
+
+    torch.manual_seed(7)
+    vocab_size, seq_len = 50, 8
+    config = GPT2Config(
+        vocab_size=vocab_size, n_positions=seq_len,
+        n_embd=16, n_layer=2, n_head=2,
+    )
+    model = GPT2LMHeadModel(config)
+    dataset = TinyLMDataset(vocab_size=vocab_size, seq_len=seq_len, n_examples=32)
+
+    def get_tracked_param(m):
+        return next(m.parameters()).flatten()[0].item()
+
+    checkpoint_value_holder = {}
+
+    guardrail_cb = GuardrailCallback()
+    chaos_cb = ChaosInjectionCallback(inject_at_step=3)
+    reporting_cb = ReportingCallback(tracked_param_getter=get_tracked_param)
+
+    training_args = TrainingArguments(
+        output_dir="/tmp/tensorscript_real_trainer_verification",
+        max_steps=6,
+        per_device_train_batch_size=4,
+        logging_steps=1,
+        save_strategy="steps",
+        save_steps=2,
+        save_total_limit=1,
+        report_to=[],
+        disable_tqdm=True,
+        learning_rate=0.01,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        # Order matters: chaos injects at on_step_end (before this step's
+        # on_log fires), guardrail reacts to the resulting logged loss,
+        # reporting observes the aftermath — all via real Trainer dispatch.
+        callbacks=[chaos_cb, guardrail_cb, reporting_cb],
+    )
+
+    log("Running a genuine transformers.Trainer loop — real GPT-2 architecture,")
+    log("real optimizer, real checkpoint saving, real callback dispatch.\n")
+
+    trainer.train()
+
+    log(f"{'step':>4}  {'loss':>10}  {'tracked_param':>14}  should_stop")
+    for e in reporting_cb.events:
+        log(f"{e['step']:>4}  {e['loss']:>10.4f}  {e['tracked_param']:>14.4f}  {e['should_training_stop']}")
+
+    assert guardrail_cb._has_checkpoint, "FAIL: GuardrailCallback.on_save was never triggered by real Trainer"
+    log("\nPASS: on_save fired from genuine Trainer checkpoint saving (save_steps=2)")
+
+    assert chaos_cb.injected, "FAIL: chaos injection never ran"
+    corrupted = chaos_cb.corrupted_value
+    log(f"\nChaos injected a real corrupted param value: {corrupted:.4f}")
+
+    # Find the step immediately after injection and confirm the tracked
+    # param no longer matches the corrupted value — i.e. it was rolled back.
+    post_injection_events = [e for e in reporting_cb.events if e["step"] >= chaos_cb.inject_at_step]
+    assert post_injection_events, "FAIL: no logged events after chaos injection"
+    post_value = post_injection_events[0]["tracked_param"]
+    log(f"Tracked param immediately after: {post_value:.4f}")
+
+    assert abs(post_value - corrupted) > 1.0, (
+        "FAIL: tracked param still matches the corrupted value — "
+        "rollback_and_scale_lr did not actually revert real Trainer-managed weights"
+    )
+    log("PASS: real Trainer-managed weights were genuinely rolled back — not just logged")
+
+    log("\nALL CHECKS PASSED under genuine transformers.Trainer orchestration.")
+    return "\n".join(report)
+
+
 # 2. Register tools exactly how the SDK expects them
 @mcp_server.list_tools()
 async def handle_list_tools():
@@ -261,13 +408,24 @@ async def handle_list_tools():
             name="verify_guardrail_callback",
             description=(
                 "Runs the actual TensorScript-generated GuardrailCallback class "
-                "(copied verbatim from the transpiler's output) against a real "
-                "torch.nn.Module doing genuine gradient descent. Verifies "
-                "checkpoint tracking via a real on_save call, genuine in-place "
-                "weight rollback via real load_state_dict(), real LR scaling, "
-                "and real terminate_early triggering after a flat-line loss "
-                "window. Returns a step-by-step report of real (not simulated) "
-                "numeric values."
+                "against a real torch.nn.Module doing manually-driven gradient "
+                "descent. Verifies checkpoint tracking, in-place weight "
+                "rollback, LR scaling, and terminate_early — all hand-fed, not "
+                "under a real Trainer loop."
+            ),
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="verify_guardrail_with_real_trainer",
+            description=(
+                "Runs the actual TensorScript-generated GuardrailCallback class "
+                "copied verbatim, this time attached to a genuine "
+                "transformers.Trainer training a real (tiny, from-scratch) "
+                "GPT-2 model. Verifies on_save and on_log are correctly "
+                "triggered by real Trainer internals (not simulated), and "
+                "that rollback_and_scale_lr genuinely reverts real "
+                "Trainer-managed model weights after a deterministically "
+                "injected loss spike."
             ),
             inputSchema={"type": "object", "properties": {}}
         ),
@@ -286,6 +444,12 @@ async def handle_call_tool(name: str, arguments: dict):
     if name == "verify_guardrail_callback":
         try:
             result_text = run_real_torch_guardrail_verification()
+        except Exception:
+            result_text = "VERIFICATION FAILED with an exception:\n\n" + traceback.format_exc()
+        return [TextContent(type="text", text=result_text)]
+    if name == "verify_guardrail_with_real_trainer":
+        try:
+            result_text = run_real_trainer_guardrail_verification()
         except Exception:
             result_text = "VERIFICATION FAILED with an exception:\n\n" + traceback.format_exc()
         return [TextContent(type="text", text=result_text)]
@@ -331,16 +495,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 5. Mount the MCP transport as raw Starlette Route/Mount objects, appended
-#    directly onto FastAPI's underlying router. This is deliberate, not an
-#    oversight: FastAPI's @app.get/@app.post decorators route every return
-#    value (including None) through FastAPI's own response-serialization
-#    layer, which tries to send a *second* response after connect_sse and
-#    handle_post_message have already completed one via their own raw
-#    ASGI send() calls — producing "Unexpected ASGI message
-#    'http.response.start' sent, after response already completed."
-#    Plain Starlette Route/Mount objects bypass that layer entirely, which
-#    is why every official MCP SSE example uses Starlette directly for
-#    these two endpoints rather than a framework's higher-level decorators.
+# 5. Mount the MCP transport as raw Starlette Route/Mount objects — see
+#    the note in handle_sse's docstring and prior debugging history for
+#    why this can't be FastAPI's @app.get/@app.post decorators.
 app.router.routes.append(Route("/sse", endpoint=handle_sse, methods=["GET"]))
 app.router.routes.append(Mount("/messages/", app=sse_transport.handle_post_message))
