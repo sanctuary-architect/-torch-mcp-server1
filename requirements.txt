@@ -3,3 +3,5 @@ uvicorn
 fastapi
 torch --index-url https://pytorch.org
 numpy
+transformers
+accelerate
